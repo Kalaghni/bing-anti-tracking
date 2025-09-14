@@ -1,73 +1,61 @@
 # Bing Direct Links (Edge)
 
-A tiny Microsoft Edge (Chromium) extension that rewrites Bing result links (e.g. `/ck/a?...`) to the real destination URL, removing Bing/MSN redirectors and common tracking parameters.
+Rewrite Bing result links to their real destinations. No redirects, fewer trackers. Microsoft Edge / Chromium MV3.
 
-## Features
-- Replaces redirect wrappers with the direct `https://…` link on search, news, images, and videos
-- Strips common tracking params (`utm_*`, `gclid`, `msclkid`, `fbclid`, etc.)
-- Works with Bing’s base64-encoded URLs (including the `a1aHR0…` variant)
-- Resilient to SPA navigation and dynamic page updates
-- No background/service worker; content script only
-
-## Install (Unpacked)
-1. Save these files into a folder (e.g., `bing-direct-links/`):
+## Setup
+1. Clone or download this repo.
+2. Ensure the folder contains:
    - `manifest.json`
    - `content.js`
-2. Open `edge://extensions` → toggle **Developer mode**.
-3. Click **Load unpacked** → select the `bing-direct-links/` folder.
-4. In the extension’s **Details**, enable **Allow access to search page results**.
-5. Visit Bing, run a search, and hover a result — you should see the real destination domain in the status bar.
+3. Open `edge://extensions` → toggle **Developer mode**.
+4. Click **Load unpacked** → select the project folder.
+5. In **Details**, enable **Allow access to search page results**.
 
-> **Note:** The manifest targets Edge/Chromium MV3. If your Edge is older and doesn’t support `"world": "MAIN"` for content scripts, remove that field from `manifest.json` and reload.
+> If your Edge build complains about `"world": "MAIN"` in the manifest, remove that field and reload.
 
-## How it works
-- Detects Bing redirect hosts/paths (e.g., `bing.com/ck/a`, `r.msn.com`, `news/apiclick`, `images/click`).
-- Extracts the real URL from parameters like `u`, `ru`, `url`, `murl`, `vidurl`, etc.
-- Decodes nested percent-encodings and url-safe base64 (including the `a1` prefix before base64 payloads). Example:
-  ```text
-  https://www.bing.com/ck/a?...&u=a1aHR0cHM6Ly9leGFtcGxlLmNvbS8...
-  → https://example.com/
-  ```
-- Removes tracking params from the final URL, then writes it back to the anchor and disables ping beacons.
+## Usage
+- Go to Bing and run any search.
+- Hover a result: the status bar should show the **final site** (not `bing.com/ck/a…`).
+- Right‑click → **Copy link** should copy the direct URL.
 
-## Debugging
-1. Open DevTools Console on a Bing results page.
-2. Enable logs:
-   ```js
-   localStorage.setItem('bingDirect.debug', '1'); location.reload();
-   ```
-3. Look for messages like:
-   ```
-   [BingDirect] batch rewrote 12 link(s)
-   [BingDirect] rewrote → https://example.com/ from /ck/a?...&u=a1aHR0...
-   ```
-4. Right‑click a result → **Copy link** should yield the direct URL (not `bing.com/...`).
+### Optional debug
+Open DevTools Console on a results page and run:
+```js
+localStorage.setItem('bingDirect.debug','1'); location.reload();
+```
+You’ll see logs like:
+```
+[BingDirect] batch rewrote 12 link(s)
+[BingDirect] rewrote → https://example.com/ from /ck/a?...&u=a1aHR0...
+```
+Disable with:
+```js
+localStorage.removeItem('bingDirect.debug')
+```
+
+## What it does
+- Detects Bing/MSN redirect patterns (e.g., `/ck/a`, `news/apiclick`, `images/click`).
+- Extracts the real URL from params like `u`, `ru`, `url`, `murl`, `vidurl`, etc.
+- Decodes nested percent‑encodes and Base64‑URL (incl. the `a1aHR0…` variant).
+- Removes common tracking params (`utm_*`, `gclid`, `msclkid`, `fbclid`, …).
+- Disables `ping` beacons and click handlers that try to re‑wrap links.
 
 ## Permissions
-- `host_permissions`: `*://*.bing.com/*` (read/modify pages on Bing only)
-- No external requests, storage is only used for the optional debug flag.
+- `*://*.bing.com/*` (content script only)
+- No background/service worker, no external network calls.
 
 ## Privacy
-- No analytics, no network calls, no data leaves your browser.
+No analytics or data collection. All rewriting happens locally in your browser.
 
-## Troubleshooting
-- **No effect on links**: In Edge extension **Details**, ensure **Allow access to search page results** is ON.
-- **Still seeing redirects**: Refresh the page after loading results; SPA updates are handled, but a manual refresh ensures the content script ran early.
-- **A new redirect shape appears**: Copy the raw `href` from “Copy link” and add its param name/path to `CANDIDATE_PARAMS` / `REDIRECT_PATH_RE` in `content.js`.
-
-## Development notes
-- Core logic lives in `content.js`:
-  - `REDIRECT_PATH_RE`: regex for Bing redirect paths.
-  - `CANDIDATE_PARAMS`: list of params that may contain the real URL.
-  - `decodeWeirdBingBase64()`: handles `a1`+base64 and finds `aHR0` chunks.
-  - MutationObserver keeps links fixed as Bing re-renders.
-- MV3; no background service worker needed.
+## Contributing
+New redirect shape? Paste a sample `href` in an issue/PR and, if needed, extend:
+- `REDIRECT_PATH_RE` (add path patterns)
+- `CANDIDATE_PARAMS` (add param names)
 
 ## Version history
-- **1.2** — Robust decoding for `a1aHR0…` and nested encodes; better coverage for news/images/video; minor hardening.
-- **1.1** — Inject in main world; broader redirect detection; debug logs.
+- **1.2** — Robust `a1aHR0…` decoding & nested encodes; broader coverage.
+- **1.1** — Main‑world injection; debug logs; more detectors.
 - **1.0** — Initial release.
 
 ## License
 MIT
-

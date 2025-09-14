@@ -1,36 +1,42 @@
 (() => {
     'use strict';
 
-    // Known redirect hosts seen on Bing properties.
-    const REDIRECT_HOSTS = new Set([
-        'www.bing.com',
-        'cn.bing.com',
-        'bing.com',
-        // Bing occasionally uses MSN redirectors for some result types
-        'r.msn.com',
-        'go.msn.com'
-    ]);
+    const DEBUG = () => !!localStorage.getItem('bingDirect.debug');
+    const log = (...args) => DEBUG() && console.debug('[BingDirect]', ...args);
 
-    // Parameters that often contain the real destination (plain or base64-encoded)
-    const CANDIDATE_PARAMS = ['u', 'r', 'ru', 'url', 'target', 'lurl', 'redir', 'to', 'q'];
+    const REDIRECT_HOSTS = new Set(['bing.com','www.bing.com','cn.bing.com','r.msn.com','go.msn.com']);
+    const REDIRECT_PATH_RE = /^\/(ck\/a|aclick|r|f|fd\/ls|news\/apiclick|images\/click|videos\/redir)/i;
 
-    // Common tracking params to strip from the final URL
-    const STRIP_PARAMS = [
-        'msclkid', 'msads_clickid', 'utm_source', 'utm_medium', 'utm_campaign',
-        'utm_term', 'utm_content', 'gclid', 'gclsrc', 'fbclid', 'dclid',
-        'mc_eid', 'oly_enc_id', 'oly_anon_id'
+    const CANDIDATE_PARAMS = [
+        'u','ru','r','url','target','to',
+        'murl','mediaurl','imgurl','imgurl2','purl','vidurl','vurl','lurl'
     ];
 
-    function base64UrlToUtf8(b64) {
-        try {
-            // Convert URL-safe base64 -> standard
-            let s = b64.replace(/-/g, '+').replace(/_/g, '/');
-            // Pad
-            while (s.length % 4 !== 0) s += '=';
-            const bin = atob(s);
-            // Convert binary to UTF-8
+    const STRIP_PARAMS = [
+        'msclkid','msads_clickid','utm_source','utm_medium','utm_campaign','utm_term','utm_content',
+        'gclid','gclsrc','fbclid','dclid','mc_eid','oly_enc_id','oly_anon_id'
+    ];
+
+    const processed = new WeakSet();
+
+    function multiDecodeURIComponent(s, times = 3) {
+        for (let i = 0; i < times; i++) {
             try {
-                return decodeURIComponent(bin.split('').map(c => '%' + c.charCodeAt(0).toString(16).padStart(2, '0')).join(''));
+                const d = decodeURIComponent(s);
+                if (d === s) return s;
+                s = d;
+            } catch { return s; }
+        }
+        return s;
+    }
+
+    function base64UrlToUtf8(s) {
+        try {
+            s = s.replace(/-/g,'+').replace(/_/g,'/');
+            while (s.length % 4) s += '=';
+            const bin = atob(s);
+            try {
+                return decodeURIComponent([...bin].map(c => '%' + c.charCodeAt(0).toString(16).padStart(2,'0')).join(''));
             } catch {
                 return bin;
             }
@@ -39,34 +45,69 @@
         }
     }
 
-    function extractDestFromParams(urlObj) {
-        const sp = urlObj.searchParams;
-        for (const key of CANDIDATE_PARAMS) {
-            if (!sp.has(key)) continue;
-            const raw = sp.get(key);
-            if (!raw) continue;
-
-            // 1) Try percent-decoding first
-            let val = raw;
-            try { val = decodeURIComponent(val); } catch {}
-
-            // If it already looks like a URL, use it
-            if (/^https?:\/\//i.test(val)) return val;
-
-            // 2) Try base64/url-safe base64
-            const maybe = base64UrlToUtf8(val);
-            if (maybe && /^https?:\/\//i.test(maybe)) return maybe;
+    // NEW: normalize Bing’s weird “a1<base64>” pattern or grab from the first aHR0… chunk.
+    function decodeWeirdBingBase64(s) {
+        if (!s) return null;
+        // Strip aX prefix sometimes added before the base64 payload (e.g., "a1aHR0...")
+        const m = s.match(/^a\d([A-Za-z0-9\-_]+=*)$/i);
+        if (m) {
+            const out = base64UrlToUtf8(m[1]);
+            if (out && /^https?:\/\//i.test(out)) return out;
+        }
+        // Find the first aHR0… (which is base64 for “http”) and decode from there
+        const i = s.indexOf('aHR0');
+        if (i >= 0) {
+            const tail = s.slice(i).replace(/[^A-Za-z0-9\-_]/g, ''); // keep base64url chars only
+            const out = base64UrlToUtf8(tail);
+            if (out && /^https?:\/\//i.test(out)) return out;
         }
         return null;
     }
 
-    function fromDataAttrs(a) {
-        const attrs = ['data-rawhref', 'data-rawurl', 'data-href', 'data-url', 'data-dest', 'data-link'];
-        for (const name of attrs) {
-            if (a.hasAttribute(name)) {
-                const v = a.getAttribute(name);
-                if (v && /^https?:\/\//i.test(v)) return v;
+    function maybeUrl(s) {
+        if (!s) return null;
+
+        // Raw URL?
+        if (/^https?:\/\//i.test(s)) return s;
+
+        // Percent-decode up to 3 times (handles nested encodes)
+        const d1 = multiDecodeURIComponent(s, 3);
+        if (/^https?:\/\//i.test(d1)) return d1;
+
+        // Base64 (including Bing’s a1+base64 flavor)
+        const b = decodeWeirdBingBase64(s) || base64UrlToUtf8(s);
+        if (b && /^https?:\/\//i.test(b)) return b;
+
+        // Sometimes a param is itself a query string containing url=...
+        try {
+            const inner = new URLSearchParams(d1);
+            for (const k of CANDIDATE_PARAMS) {
+                if (inner.has(k)) {
+                    const nested = maybeUrl(inner.get(k));
+                    if (nested) return nested;
+                }
             }
+        } catch { /* not a query string */ }
+
+        return null;
+    }
+
+    function extractFromParams(u) {
+        for (const k of CANDIDATE_PARAMS) {
+            if (!u.searchParams.has(k)) continue;
+            const raw = u.searchParams.get(k);
+            const candidate = maybeUrl(raw);
+            if (candidate) return candidate;
+        }
+        return null;
+    }
+
+    function extractFromDataAttrs(a) {
+        const attrs = ['data-rawhref','data-rawurl','data-url','data-dest','data-link','data-href','h'];
+        for (const name of attrs) {
+            if (!a.hasAttribute(name)) continue;
+            const candidate = maybeUrl(a.getAttribute(name));
+            if (candidate) return candidate;
         }
         return null;
     }
@@ -74,132 +115,95 @@
     function stripTracking(uStr) {
         try {
             const u = new URL(uStr);
-            for (const k of STRIP_PARAMS) u.searchParams.delete(k);
+            for (const p of STRIP_PARAMS) u.searchParams.delete(p);
             return u.toString();
         } catch {
             return uStr;
         }
     }
 
-    function looksLikeRedirect(href) {
+    function isBingRedirect(href) {
         if (!href) return false;
         try {
-            const u = new URL(href, location.origin);
+            const u = new URL(href, location.href);
             if (!REDIRECT_HOSTS.has(u.hostname)) return false;
-            // If any of our candidate params exist, it’s almost certainly a redirect wrapper
+            if (REDIRECT_PATH_RE.test(u.pathname)) return true;
             for (const k of CANDIDATE_PARAMS) if (u.searchParams.has(k)) return true;
-            // Additionally, common Bing redirect paths
-            return /^\/(ck\/a|aclick|r|f|fd\/ls|news\/apiclick)/i.test(u.pathname);
+            return false;
         } catch {
             return false;
         }
     }
 
-    const processed = new WeakSet();
-
     function rewriteAnchor(a) {
-        if (!a || processed.has(a)) return;
-
+        if (!a || processed.has(a)) return false;
+        const orig = a.getAttribute('href') || '';
         let newHref = null;
-        const href = a.getAttribute('href');
 
-        if (href && looksLikeRedirect(href)) {
-            try {
-                const u = new URL(href, location.origin);
-                newHref = extractDestFromParams(u);
-            } catch {
-                /* no-op */
-            }
+        if (isBingRedirect(orig)) {
+            try { newHref = extractFromParams(new URL(orig, location.href)); } catch {}
         }
-
-        if (!newHref) {
-            // Some result types stash the real URL in data- attrs
-            newHref = fromDataAttrs(a);
-        }
+        if (!newHref) newHref = extractFromDataAttrs(a);
 
         if (newHref) {
             newHref = stripTracking(newHref);
             a.setAttribute('href', newHref);
-            // Kill common tracking hooks
             a.removeAttribute('ping');
             a.removeAttribute('onmousedown');
             a.removeAttribute('data-ct');
-
-            // Safer default rel
             const rel = new Set((a.getAttribute('rel') || '').split(/\s+/).filter(Boolean));
-            rel.add('noreferrer');
-            rel.add('noopener');
+            rel.add('noreferrer'); rel.add('noopener');
             a.setAttribute('rel', Array.from(rel).join(' '));
-
+            a.dataset.bingDirect = '1';
             processed.add(a);
+            log('rewrote →', newHref, 'from', orig.slice(0, 160));
+            return true;
         }
+        return false;
     }
 
     function rewriteAll(root = document) {
-        const anchors = root.querySelectorAll('a[href], a[data-rawhref], a[data-rawurl], a[data-url], a[data-dest]');
-        for (const a of anchors) rewriteAnchor(a);
+        let n = 0;
+        const sel = 'a[href], a[data-rawhref], a[data-rawurl], a[data-url], a[data-dest], a[data-link], a[h]';
+        for (const a of root.querySelectorAll(sel)) n += rewriteAnchor(a) ? 1 : 0;
+        if (n) log('batch rewrote', n, 'link(s)');
     }
 
-    // Prevent Bing's capture handlers from re-wrapping the link after we fix it.
     function stopBingRewriters(e) {
-        const a = e.target && (e.target.closest ? e.target.closest('a') : null);
-        if (!a) return;
-        // If we've already rewritten to a direct (non-Bing/MSN) URL, block Bing’s listeners in the capture phase.
+        const a = e.target?.closest?.('a');
+        if (!a || !a.href) return;
         try {
-            const h = new URL(a.href);
-            if (!REDIRECT_HOSTS.has(h.hostname)) e.stopPropagation();
-        } catch {
-            /* ignore */
-        }
+            const u = new URL(a.href);
+            if (!REDIRECT_HOSTS.has(u.hostname)) e.stopPropagation();
+        } catch {}
     }
 
-    // Run early & often
     rewriteAll();
-
     document.addEventListener('DOMContentLoaded', () => rewriteAll(), { once: true });
 
-    const observer = new MutationObserver(muts => {
+    const mo = new MutationObserver(muts => {
         for (const m of muts) {
             if (m.type === 'childList') {
-                for (const node of m.addedNodes) {
-                    if (node && node.nodeType === 1) rewriteAll(node);
-                }
-            } else if (
-                m.type === 'attributes' &&
-                m.target &&
-                m.target.nodeType === 1 &&
-                m.attributeName === 'href' &&
-                m.target.tagName === 'A'
-            ) {
+                for (const node of m.addedNodes) if (node?.nodeType === 1) rewriteAll(node);
+            } else if (m.type === 'attributes' && m.attributeName === 'href' && m.target?.tagName === 'A') {
                 rewriteAnchor(m.target);
             }
         }
     });
-
-    observer.observe(document.documentElement || document.body, {
-        subtree: true,
-        childList: true,
-        attributes: true,
-        attributeFilter: ['href']
+    mo.observe(document.documentElement || document.body, {
+        subtree: true, childList: true, attributes: true, attributeFilter: ['href']
     });
 
-    // Beat site handlers in the capture phase
-    for (const evt of ['mousedown', 'pointerdown', 'touchstart', 'auxclick', 'click']) {
+    for (const evt of ['mousedown','pointerdown','touchstart','auxclick','click']) {
         document.addEventListener(evt, stopBingRewriters, true);
     }
 
-    // Handle SPA navigations
     const _ps = history.pushState;
-    history.pushState = function (...args) {
-        const r = _ps.apply(this, args);
-        queueMicrotask(rewriteAll);
-        return r;
-    };
+    history.pushState = function(...args) { const r = _ps.apply(this, args); queueMicrotask(rewriteAll); return r; };
     const _rs = history.replaceState;
-    history.replaceState = function (...args) {
-        const r = _rs.apply(this, args);
-        queueMicrotask(rewriteAll);
-        return r;
-    };
+    history.replaceState = function(...args) { const r = _rs.apply(this, args); queueMicrotask(rewriteAll); return r; };
     window.addEventListener('popstate', () => queueMicrotask(rewriteAll));
 })();
+
+
+console.log("TEST")
